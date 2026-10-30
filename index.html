@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Match-3</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+  html,body{height:100%;overflow:hidden;background:#12122a;font-family:system-ui,-apple-system,sans-serif;touch-action:none}
+  canvas{display:block;width:100%;height:100%}
+  #hud{position:fixed;top:env(safe-area-inset-top,8px);left:0;right:0;padding:12px 16px;display:flex;justify-content:space-between;color:#fff;font-weight:700;font-size:16px;text-shadow:0 2px 6px #000a;pointer-events:none;z-index:5}
+  #hint{position:fixed;bottom:calc(env(safe-area-inset-bottom,8px) + 12px);left:0;right:0;text-align:center;color:#fff6;font-size:13px;pointer-events:none;z-index:5}
+  #reset{position:fixed;top:calc(env(safe-area-inset-top,8px) + 44px);right:12px;z-index:6;background:#ffffff1a;color:#fff;border:none;padding:8px 14px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;backdrop-filter:blur(6px)}
+  #reset:active{background:#ffffff33}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><span id="hL"></span><span id="hR"></span></div>
+<div id="hint">Свайп или два тапа по соседним клеткам</div>
+<button id="reset">↻ Заново</button>
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+const hL = document.getElementById('hL');
+const hR = document.getElementById('hR');
+
+let W = 0, H = 0;
+const DPR = Math.min(devicePixelRatio || 1, 2);
+
+const COLS = 8, ROWS = 8, TYPES = 6;
+const COLORS = ['#e94560','#f2c94c','#6fcf97','#56ccf2','#bb6bd9','#f2994a'];
+const GLOW   = ['#ff7a92','#ffe27a','#a4f5c8','#9be3ff','#dfa8ff','#ffbf85'];
+
+// ================= AUDIO =================
+let audioCtx = null;
+function ensureAudio(){
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+// «разблокируем» звук на первом касании
+addEventListener('touchstart', ensureAudio, { once:true, passive:true });
+addEventListener('mousedown', ensureAudio, { once:true });
+
+function beep(freq, dur, type='sine', vol=0.15, slideTo=null){
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  if (slideTo != null) {
+    o.frequency.exponentialRampToValueAtTime(Math.max(40, slideTo), audioCtx.currentTime + dur);
+  }
+  g.gain.setValueAtTime(vol, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + dur + 0.02);
+}
+function noisePop(dur=0.12, vol=0.15, startFreq=800, endFreq=200){
+  if (!audioCtx) return;
+  // короткий шумовой «поп» через осциллятор с быстрым спадом
+  beep(startFreq, dur, 'triangle', vol, endFreq);
+}
+function sfxSwap(){ ensureAudio(); beep(520, 0.08, 'square', 0.10, 760); }
+function sfxSwapBack(){ ensureAudio(); beep(420, 0.10, 'square', 0.10, 260); }
+function sfxMatch(cascade){
+  ensureAudio();
+  const base = 660 + (cascade - 1) * 140;
+  noisePop(0.13, 0.16, base, base * 0.35);
+  // второй тон для «дзынь»
+  setTimeout(()=>beep(base * 1.6, 0.09, 'sine', 0.08, base * 0.9), 30);
+}
+function sfxLand(){ ensureAudio(); beep(180, 0.06, 'sine', 0.07, 120); }
+function sfxCombo(c){
+  ensureAudio();
+  beep(660 + c * 80, 0.10, 'sine', 0.10);
+  setTimeout(()=>beep(880 + c * 80, 0.12, 'sine', 0.10), 70);
+}
+function sfxOver(){
+  ensureAudio();
+  beep(400, 0.12, 'sine', 0.12, 300);
+  setTimeout(()=>beep(300, 0.14, 'sine', 0.12, 200), 110);
+  setTimeout(()=>beep(200, 0.20, 'sine', 0.12, 120), 230);
+}
+
+// ================= СОСТОЯНИЕ =================
+let board;
+let fx = [];
+let score = 0, sel = null, combo = 0;
+let particles = [];
+let comboBanner = null;
+let bgBlobs = [];
+let cell = 40, offsetX = 0, offsetY = 0;
+let inited = false;
+let dragStartCell = null;
+let time = 0;
+
+// анимация обмена
+let swapAnim = null; // {a, b, t, dur, phase:'swap'|'back', matched:bool}
+
+function getBest(){ return +localStorage.getItem('match_best') || 0; }
+function saveBest(){ if (score > getBest()) localStorage.setItem('match_best', score); }
+
+function rndType(){ return Math.floor(Math.random() * TYPES); }
+
+function newBoard(){
+  board = [];
+  for (let r = 0; r < ROWS; r++) {
+    const row = [];
+    for (let cc = 0; cc < COLS; cc++) {
+      let t, guard = 0;
+      do { t = rndType(); guard++; }
+      while (guard < 20 && (
+        (cc >= 2 && row[cc-1] === t && row[cc-2] === t) ||
+        (r >= 2 && board[r-1][cc] === t && board[r-2][cc] === t)
+      ));
+      row.push(t);
+    }
+    board.push(row);
+  }
+  fx = [];
+  for (let r = 0; r < ROWS; r++) {
+    const frow = [];
+    for (let cc = 0; cc < COLS; cc++) {
+      frow.push({ x: cc, y: r - ROWS, scale: 1, flash: 0, pop: 0 });
+    }
+    fx.push(frow);
+  }
+}
+
+function computeLayout(){
+  const pad = 12;
+  const header = 90;
+  const availH = H - header - pad;
+  const availW = W - pad * 2;
+  cell = Math.floor(Math.min(availW / COLS, availH / ROWS));
+  const bw = cell * COLS, bh = cell * ROWS;
+  offsetX = (W - bw) / 2;
+  offsetY = header + (availH - bh) / 2;
+}
+
+function makeBlobs(){
+  bgBlobs = [];
+  for (let i = 0; i < 5; i++) {
+    bgBlobs.push({
+      x: Math.random() * W, y: Math.random() * H,
+      r: 60 + Math.random() * 120,
+      vx: (Math.random() - 0.5) * 0.3,
+      vy: (Math.random() - 0.5) * 0.3,
+      color: COLORS[Math.floor(Math.random() * COLORS.length)],
+      alpha: 0.04 + Math.random() * 0.04
+    });
+  }
+}
+
+function resize(){
+  W = innerWidth; H = innerHeight;
+  c.width = W * DPR; c.height = H * DPR;
+  c.style.width = W + 'px'; c.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (inited) { computeLayout(); makeBlobs(); }
+}
+
+function reset(){
+  newBoard();
+  score = 0; sel = null; combo = 0;
+  particles = []; comboBanner = null;
+  swapAnim = null;
+  computeLayout();
+  makeBlobs();
+  inited = true;
+  for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+    fx[r][cc].y = r - ROWS - Math.random() * 3;
+  }
+}
+
+function cellAt(x, y){
+  if (x < offsetX || y < offsetY) return null;
+  const cc = Math.floor((x - offsetX) / cell);
+  const rr = Math.floor((y - offsetY) / cell);
+  if (cc < 0 || cc >= COLS || rr < 0 || rr >= ROWS) return null;
+  return { r: rr, c: cc };
+}
+
+function findMatches(){
+  const matches = new Set();
+  for (let r = 0; r < ROWS; r++) {
+    let run = 1;
+    for (let cc = 1; cc <= COLS; cc++) {
+      if (cc < COLS && board[r][cc] === board[r][cc-1] && board[r][cc] !== -1) run++;
+      else { if (run >= 3) for (let k = cc - run; k < cc; k++) matches.add(r + ',' + k); run = 1; }
+    }
+  }
+  for (let cc = 0; cc < COLS; cc++) {
+    let run = 1;
+    for (let r = 1; r <= ROWS; r++) {
+      if (r < ROWS && board[r][cc] === board[r-1][cc] && board[r][cc] !== -1) run++;
+      else { if (run >= 3) for (let k = r - run; k < r; k++) matches.add(k + ',' + cc); run = 1; }
+    }
+  }
+  return matches;
+}
+
+// просто меняем данные (для проверки ходов)
+function swapData(a, b){
+  const t = board[a.r][a.c];
+  board[a.r][a.c] = board[b.r][b.c];
+  board[b.r][b.c] = t;
+}
+
+function hasAnyMove(){
+  for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+    if (cc < COLS - 1) {
+      swapData({r,c:cc},{r,c:cc+1});
+      if (findMatches().size > 0) { swapData({r,c:cc},{r,c:cc+1}); return true; }
+      swapData({r,c:cc},{r,c:cc+1});
+    }
+    if (r < ROWS - 1) {
+      swapData({r,c:cc},{r:r+1,c:cc});
+      if (findMatches().size > 0) { swapData({r,c:cc},{r:r+1,c:cc}); return true; }
+      swapData({r,c:cc},{r:r+1,c:cc});
+    }
+  }
+  return false;
+}
+
+function burst(r, cc, type){
+  const x = offsetX + cc * cell + cell / 2;
+  const y = offsetY + r * cell + cell / 2;
+for (let i = 0; i < 10; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 1 + Math.random() * 4;
+    particles.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 1,
+      life: 30 + Math.random() * 15, maxLife: 45,
+      color: COLORS[type], r: 2 + Math.random() * 3
+    });
+  }
+}
+
+function resolveCascade(){
+  let total = 0;
+  combo = 0;
+  let cascadeLevel = 0;
+  while (true) {
+    const m = findMatches();
+    if (m.size === 0) break;
+    cascadeLevel++;
+    combo = cascadeLevel;
+    total += m.size;
+    score += m.size * 10 * combo;
+    sfxMatch(cascadeLevel);
+    if (cascadeLevel > 1) sfxCombo(cascadeLevel);
+    m.forEach(key => {
+      const [r, cc] = key.split(',').map(Number);
+      burst(r, cc, board[r][cc]);
+      fx[r][cc].flash = 1;
+      fx[r][cc].pop = 1;
+      board[r][cc] = -1;
+    });
+    for (let cc = 0; cc < COLS; cc++) {
+      let writeRow = ROWS - 1;
+      for (let r = ROWS - 1; r >= 0; r--) {
+        if (board[r][cc] !== -1) {
+          if (writeRow !== r) {
+            board[writeRow][cc] = board[r][cc];
+            fx[writeRow][cc].y = fx[r][cc].y;
+            fx[writeRow][cc].scale = fx[r][cc].scale;
+            board[r][cc] = -1;
+          }
+          writeRow--;
+        }
+      }
+      for (let r = writeRow; r >= 0; r--) {
+        board[r][cc] = rndType();
+        fx[r][cc].y = -1 - (writeRow - r);
+        fx[r][cc].scale = 1;
+        fx[r][cc].flash = 0;
+        fx[r][cc].pop = 0;
+      }
+    }
+    if (cascadeLevel > 1) {
+      comboBanner = { text: 'Combo ×' + cascadeLevel + '!', life: 70, maxLife: 70 };
+    }
+  }
+  if (total > 0) {
+    setTimeout(sfxLand, 60);
+    saveBest();
+    let guard = 0;
+    while (!hasAnyMove() && guard++ < 10) newBoard();
+  }
+}
+
+// начало анимации обмена
+function startSwap(a, b){
+  if (swapAnim) return;
+  // меняем данные сразу — чтобы проверка совпадений работала
+  swapData(a, b);
+  // а визуал поедет
+  swapAnim = { a, b, t: 0, dur: 0.18, phase: 'swap', matched: false };
+  sfxSwap();
+  sel = null;
+}
+
+// ================= ВВОД =================
+function onPointerDown(x, y){
+  if (!inited || swapAnim) return;
+  dragStartCell = cellAt(x, y);
+  const hit = dragStartCell;
+  if (!hit) return;
+  if (!sel) { sel = hit; return; }
+  if (sel.r === hit.r && sel.c === hit.c) { sel = null; return; }
+  const dr = Math.abs(sel.r - hit.r), dc = Math.abs(sel.c - hit.c);
+  if (dr + dc === 1) startSwap(sel, hit);
+  else sel = hit;
+}
+function onPointerUp(x, y){
+  if (!dragStartCell) return;
+  const to = cellAt(x, y);
+  if (to && !swapAnim && !(to.r === dragStartCell.r && to.c === dragStartCell.c)) {
+    const dr = Math.abs(to.r - dragStartCell.r), dc = Math.abs(to.c - dragStartCell.c);
+    if (dr + dc === 1) { startSwap(dragStartCell, to); }
+  }
+  dragStartCell = null;
+}
+
+addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  onPointerDown(t.clientX, t.clientY);
+}, { passive: false });
+addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+addEventListener('touchend', e => {
+  const t = e.changedTouches[0];
+  onPointerUp(t.clientX, t.clientY);
+});
+addEventListener('mousedown', e => {
+  if (e.target.tagName === 'BUTTON') return;
+  onPointerDown(e.clientX, e.clientY);
+});
+addEventListener('mouseup', e => {
+  if (e.target.tagName === 'BUTTON') return;
+  onPointerUp(e.clientX, e.clientY);
+});
+document.getElementById('reset').addEventListener('click', reset);
+
+// ================= РЕНДЕР =================
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawTile(px, py, type, scale, flash, pop){
+  const s = (cell - 8) * scale * (1 + pop * 0.25);
+  const cx = px, cy = py;
+
+  if (flash > 0.05 || pop > 0.05) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, flash * 0.7 + pop * 0.9);
+    ctx.shadowColor = GLOW[type];
+ctx.shadowBlur = 24 * (flash + pop);
+    ctx.fillStyle = GLOW[type];
+    roundRect(cx - s/2, cy - s/2, s, s, s * 0.28);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.fillStyle = COLORS[type];
+  roundRect(cx - s/2, cy - s/2, s, s, s * 0.28);
+  ctx.fill();
+
+  const g = ctx.createLinearGradient(cx - s/2, cy - s/2, cx + s/2, cy + s/2);
+  g.addColorStop(0, 'rgba(255,255,255,0.35)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.18)');
+  ctx.fillStyle = g;
+  roundRect(cx - s/2, cy - s/2, s, s, s * 0.28);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath();
+  ctx.arc(cx - s * 0.18, cy - s * 0.18, s * 0.1, 0, 7);
+  ctx.fill();
+
+  if (flash > 0) {
+    ctx.save();
+    ctx.globalAlpha = flash;
+    ctx.fillStyle = '#fff';
+    roundRect(cx - s/2, cy - s/2, s, s, s * 0.28);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function update(){
+  time++;
+  if (comboBanner) { comboBanner.life--; if (comboBanner.life <= 0) comboBanner = null; }
+
+  // === анимация обмена ===
+  if (swapAnim) {
+    swapAnim.t += 1 / 60;
+    if (swapAnim.t >= swapAnim.dur) {
+      // конец текущей фазы
+      if (swapAnim.phase === 'swap') {
+        const m = findMatches();
+        if (m.size > 0) {
+          // удачно — запускаем каскад
+          swapAnim = null;
+          resolveCascade();
+        } else {
+          // откат
+          swapData(swapAnim.a, swapAnim.b);
+          const a = swapAnim.a, b = swapAnim.b;
+          swapAnim = { a, b, t: 0, dur: 0.14, phase: 'back' };
+          sfxSwapBack();
+        }
+      } else {
+        // конец отката
+        swapAnim = null;
+      }
+    }
+  }
+
+  // подтягиваем визуальные позиции к логическим
+  const speedK = 0.28;
+  for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+    const f = fx[r][cc];
+    f.x += (cc - f.x) * speedK;
+    f.y += (r - f.y) * speedK;
+    if (f.flash > 0) f.flash -= 0.06;
+    if (f.pop > 0) f.pop -= 0.05;
+    if (f.flash < 0) f.flash = 0;
+    if (f.pop < 0) f.pop = 0;
+  }
+  for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+    const f = fx[r][cc];
+    if (f.y > r) f.y += (r - f.y) * 0.15;
+  }
+
+  particles.forEach(p => {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.vx *= 0.98; p.life--;
+  });
+  particles = particles.filter(p => p.life > 0);
+
+  bgBlobs.forEach(b => {
+    b.x += b.vx; b.y += b.vy;
+    if (b.x < -b.r) b.x = W + b.r;
+    if (b.x > W + b.r) b.x = -b.r;
+    if (b.y < -b.r) b.y = H + b.r;
+    if (b.y > H + b.r) b.y = -b.r;
+  });
+}
+
+// рисуем фишку на экранных координатах с учётом swapAnim
+function drawAtScreen(px, py, type, scale, flash, pop){
+  drawTile(px, py, type, scale, flash, pop);
+}
+
+function draw(){
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1a1a2e');
+  g.addColorStop(1, '#0f0f24');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  bgBlobs.forEach(b => {
+    ctx.save();
+    ctx.globalAlpha = b.alpha;
+    ctx.fillStyle = b.color;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+    ctx.restore();
+  });
+
+  ctx.save();
+  ctx.shadowColor = '#000000aa';
+  ctx.shadowBlur = 30;
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  roundRect(offsetX - 6, offsetY - 6, cell * COLS + 12, cell * ROWS + 12, 14);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+  ctx.lineWidth = 1;
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(offsetX, offsetY + r * cell); ctx.lineTo(offsetX + cell * COLS, offsetY + r * cell); ctx.stroke();
+  }
+  for (let cc = 0; cc <= COLS; cc++) {
+    ctx.beginPath(); ctx.moveTo(offsetX + cc * cell, offsetY); ctx.lineTo(offsetX + cc * cell, offsetY + cell * ROWS); ctx.stroke();
+  }
+
+  // рассчитаем дополнительный сдвиг для двух обменивающихся клеток
+  let extraX = {}, extraY = {};
+  if (swapAnim) {
+    const {a, b, t, dur, phase} = swapAnim;
+    const p = Math.min(1, t / dur);
+    // easing
+    const e = p < 0.5 ? 2*p*p : -1 + (4 - 2*p)*p;
+    // в фазе 'swap': фишка в a едет в b, фишка в b едет в a
+// в фазе 'back': наоборот (мы уже обменяли данные — визуал нужно вернуть)
+    const aIdx = a.r + ',' + a.c;
+    const bIdx = b.r + ',' + b.c;
+    const dir = phase === 'swap' ? 1 : -1;
+    const dx = (b.c - a.c) * cell * e * dir;
+    const dy = (b.r - a.r) * cell * e * dir;
+    extraX[aIdx] = dx;
+    extraY[aIdx] = dy;
+    extraX[bIdx] = -dx;
+    extraY[bIdx] = -dy;
+  }
+
+  for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+    const type = board[r][cc];
+    if (type === -1) continue;
+    const f = fx[r][cc];
+    const idx = r + ',' + cc;
+    const px = offsetX + f.x * cell + cell / 2 + (extraX[idx] || 0);
+    const py = offsetY + f.y * cell + cell / 2 + (extraY[idx] || 0);
+    drawAtScreen(px, py, type, f.scale, f.flash, f.pop);
+  }
+
+  if (sel && !swapAnim) {
+    const pulse = 0.6 + Math.sin(time * 0.15) * 0.4;
+    ctx.save();
+    ctx.strokeStyle = '#fff';
+    ctx.globalAlpha = pulse;
+    ctx.lineWidth = 3;
+    ctx.shadowColor = '#fff';
+    ctx.shadowBlur = 16;
+    roundRect(offsetX + sel.c * cell + 3, offsetY + sel.r * cell + 3, cell - 6, cell - 6, 8);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  particles.forEach(p => {
+    const a = p.life / p.maxLife;
+    ctx.globalAlpha = a;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * a, 0, 7); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  if (comboBanner) {
+    const a = comboBanner.life / comboBanner.maxLife;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = '#f2c94c';
+    ctx.shadowBlur = 30;
+    ctx.font = 'bold ' + (36 + (1 - a) * 20) + 'px system-ui';
+    ctx.fillText(comboBanner.text, W / 2, H * 0.2);
+    ctx.restore();
+  }
+
+  hL.textContent = 'Счёт: ' + score;
+  hR.textContent = 'Рекорд: ' + getBest();
+}
+
+resize();
+reset();
+function loop(){ update(); draw(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
